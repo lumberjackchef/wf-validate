@@ -1,0 +1,876 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false  # Don't cancel in-flight deploys
+
+env:
+  REGISTRY: registry.digitalocean.com
+  # Loaded from Infisical ci env by the load-infisical step (JAR-749);
+  # not a workflow-level secrets reference (those are evaluated before
+  # steps run, so the value must be read at step time).
+  IMAGE_TAG: ${{ github.sha }}
+  # Only the commit-SHA tag is pushed; `latest` was removed with .do/app.yaml
+  # (JAR-471) since no consumer references a mutable tag.
+  # JAR-1245: single source for the observability file list. It is needed in
+  # THREE places (sync-step backup loop, sync-step scp list, rollback restore
+  # loop); before this variable each copy was hand-maintained and drift was
+  # silent (backup lists a file the ship list omits => rollback no-ops).
+  # The sync-parity guard (TestObservabilityConfigsSyncedInDeploy) pins every
+  # list against podman-compose.yml's derived mount set.
+  OBS_CONFIG_FILES: "loki-config.yml alloy-config.alloy grafana-datasources.yml prometheus.yml prometheus-rules.yml tempo.yml grafana-dashboards.yml dashboards-red.json dashboards-kpis.json grafana-alerting.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Docker Images
+    runs-on: spare
+    # 25, not 15. Each matrix leg now does build + push + a full Trivy scan; on
+    # a vulnerability-DB cache miss that adds a database download, a pull of the
+    # just-pushed image, and a scan of every layer. A timeout here fails the
+    # DEPLOY for a reason unrelated to the deploy (JAR-991).
+    timeout-minutes: 25
+    strategy:
+      matrix:
+        # All six images come from the single deployments/Dockerfile, selected
+        # by the SERVICE build arg. The context is the REPO ROOT: that Dockerfile
+        # COPYs go.mod/go.sum and services/, shared/, proto/ from the root, so a
+        # services/<name> context fails at the first COPY.
+        service:
+          - name: trip-core
+            port: 8080
+          - name: user-auth
+            port: 50051
+          - name: external-data
+            port: 50052
+          - name: ml
+            port: 50053
+          - name: analytics
+            port: 50054
+          - name: ai
+            port: 8081
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Load Infisical ci secrets
+        uses: ./.github/actions/load-infisical
+        with:
+          client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          path: /core
+          required-keys: DIGITALOCEAN_ACCESS_TOKEN REGISTRY_NAME
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to DigitalOcean Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ env.DIGITALOCEAN_ACCESS_TOKEN }}
+          password: ${{ env.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Build and push ${{ matrix.service.name }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deployments/Dockerfile
+          build-args: |
+            SERVICE=${{ matrix.service.name }}
+            PORT=${{ matrix.service.port }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REGISTRY_NAME }}/${{ matrix.service.name }}:${{ env.IMAGE_TAG }}
+          cache-from: type=local,src=/tmp/.buildx-cache/${{ matrix.service.name }}
+          cache-to: type=local,dest=/tmp/.buildx-cache/${{ matrix.service.name }},mode=max
+
+      # Trivy in this job's own temp dir. The spare host's runner instances
+      # share $HOME, and a scan that ran the binary while another job was still
+      # installing it there failed with "Text file busy" (JAR-1967).
+      - name: Install Trivy for this job
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.70.0
+          cache: true
+          path: ${{ runner.temp }}/trivy
+
+      # The image that actually runs in production, scanned (JAR-769, core#459
+      # review MEDIUM 1). CI scans a `:ci` proxy build at PR time; this is a
+      # SEPARATE build from a separate workflow, so until now the exact
+      # artifacts that reach the droplets were scanned nowhere.
+      #
+      # After the push rather than before it, and the trade is worth stating.
+      # A failure here leaves the image sitting in the registry unreferenced —
+      # but `deploy` is `needs: build`, so a failing scan means it is never
+      # deployed, and the registry is not production. Gating BEFORE the push
+      # would mean building twice (load, scan, then push), and I cannot measure
+      # whether the second build is a cache hit on this runner, so it could
+      # silently double every deploy.
+      #
+      # Same gate as CI, deliberately: severity, ignore-unfixed and exit-code
+      # all match, so a PR that went green cannot fail here for a different
+      # reason and confuse whoever is watching the deploy.
+      - name: Scan the ${{ matrix.service.name }} image that will be deployed
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          # trivy-action is composite: trivy runs on the runner and picks up
+          # the docker login above via ~/.docker/config.json. State that
+          # dependency explicitly instead of leaning on runner HOME, so a
+          # future trivy-action version that runs in a container fails loudly
+          # at review time rather than 401-ing every deploy.
+          TRIVY_USERNAME: ${{ env.DIGITALOCEAN_ACCESS_TOKEN }}
+          TRIVY_PASSWORD: ${{ env.DIGITALOCEAN_ACCESS_TOKEN }}
+        with:
+          skip-setup-trivy: true
+          image-ref: ${{ env.REGISTRY }}/${{ env.REGISTRY_NAME }}/${{ matrix.service.name }}:${{ env.IMAGE_TAG }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: '1'
+
+  deploy:
+    name: Deploy to Production
+    needs: build
+    runs-on: spare
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Load Infisical ci secrets
+        uses: ./.github/actions/load-infisical
+        with:
+          client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          path: /core
+          required-keys: DROPLET_HOST DROPLET_HOST_2 DROPLET_HOST_KEY DROPLET_HOST_KEY_2 DEPLOY_USER DROPLET_SSH_KEY
+
+      # JAR-768: the deploy tree follows the deploy user, so the cutover to a
+      # non-root account is a SECRET change and not a workflow change.
+      #
+      # `root` resolves to /root/jarvis — byte-identical to the path that was
+      # hardcoded here — so this step is a no-op until someone deliberately
+      # changes DEPLOY_USER. Rolling back is setting it to `root` again; there
+      # is no revert to land and no window where the two disagree.
+      - name: Resolve the deploy tree for this user
+        env:
+          DEPLOY_USER: ${{ env.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          if [ "$DEPLOY_USER" = "root" ]; then
+            PROD_DIR=/root/jarvis
+          else
+            PROD_DIR="/home/$DEPLOY_USER/jarvis"
+          fi
+          echo "PROD_DIR=$PROD_DIR" >> "$GITHUB_ENV"
+
+      - name: Sync compose + CA cert to both serving droplets
+        # JAR-756: prod's compose file was stale (hardcoded :latest, pre
+        # JAR-471) and the deploy never updated it — deploys silently
+        # no-op'd since JAR-471 removed :latest from the registry. The repo
+        # is the source of truth: ship podman-compose.yml + the DO PG CA
+        # cert (verify-full DB TLS) before the deploy runs. Fail-closed:
+        # a failed sync aborts before any podman change.
+        # JAR-2563: synced to BOTH serving droplets (prod + prod-2) — the
+        # sync/ship/assert scripts the deploy runs must exist on every host
+        # the rolling deploy touches, or the second pass runs stale guards.
+        env:
+          DROPLET_HOST: ${{ env.DROPLET_HOST }}
+          DROPLET_HOST_2: ${{ env.DROPLET_HOST_2 }}
+          DEPLOY_USER: ${{ env.DEPLOY_USER }}
+          DROPLET_SSH_KEY: ${{ env.DROPLET_SSH_KEY }}
+          PROD_DIR: ${{ env.PROD_DIR }}
+          # JAR-1245 review: declare the dependency explicitly (like the
+          # other forwarded vars) instead of relying on workflow-level env
+          # resolution inside the run script.
+          OBS_CONFIG_FILES: ${{ env.OBS_CONFIG_FILES }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f /tmp/prod-ssh-key' EXIT
+          install -m 600 /dev/null /tmp/prod-ssh-key
+          printf '%s\n' "$DROPLET_SSH_KEY" > /tmp/prod-ssh-key
+          for HOST in "$DROPLET_HOST" "$DROPLET_HOST_2"; do
+          # Back up the host's current compose before overwriting, so the
+          # rollback path can restore the config that is actually running
+          # (JAR-756 review finding 2).
+          ssh -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
+            "$DEPLOY_USER@$HOST" \
+            "cp $PROD_DIR/podman-compose.yml $PROD_DIR/podman-compose.yml.previous 2>/dev/null || true"
+          scp -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
+            deployments/podman-compose.yml \
+            "$DEPLOY_USER@$HOST:$PROD_DIR/podman-compose.yml"
+          # The pin assertion runs FROM this tree on the remote host, so the
+          # script must ship with the compose it validates — one code path,
+          # tested in CI by deployments/liveness_sync_test.go against the
+          # same file.
+          scp -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
+            deployments/assert-liveness-pins.sh \
+            "$DEPLOY_USER@$HOST:$PROD_DIR/assert-liveness-pins.sh"
+          # Same rule as the pin assertion: the guard runs FROM the remote tree,
+          # so it must ship with the compose it checks. Tested in CI by
+          # deployments/test-assert-env-passthrough.sh against this same file.
+          scp -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
+            deployments/assert-env-passthrough.sh \
+            "$DEPLOY_USER@$HOST:$PROD_DIR/assert-env-passthrough.sh"
+          # JAR-1326: the deploy-time network boundary gate ships with the
+          # compose it protects, same one-code-path contract as
+          # assert-liveness-pins.sh above — the scanner the deploy runs is
+          # the scanner CI tests (deployments/assert_external_binds_test.go).
+          scp -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
+            deployments/assert-external-binds.sh \
+            "$DEPLOY_USER@$HOST:$PROD_DIR/assert-external-binds.sh"
+          # JAR-458: podman-compose.yml's observability services bind-mount
+          # ./observability/* relative to the compose file. The configs must
+          # ship with it: podman creates EMPTY DIRECTORIES at missing bind
+          # sources, and loki/alloy/grafana would crash-loop on missing
+          # configs on the next deploy. Each config is backed up to
+          # <name>.previous before overwrite, same fail-closed convention as
+          # the compose backup above, so the rollback path can restore the
+          # exact configs the running containers were started with. mkdir
+          # first — scp cannot create the remote directory.
+          # JAR-1245: the ten observability files are used in THREE places
+          # (backup loop here, scp list below, rollback restore loop in the
+          # Deploy step). The list is defined ONCE as OBS_CONFIG_FILES at
+          # the job env level and all three sites reference it; the
+          # sync-parity guard (TestObservabilityConfigsSyncedInDeploy)
+          # pins each against compose's derived mount list.
+          # JAR-1245: the observability log shipper (jarvis-log-ship user
+          # unit) follows `podman logs -f` per app service; the Deploy via
+          # SSH step's `podman-compose up -d` RECREATES containers whose
+          # image changed, which kills that service's follower and makes
+          # the unit exit+respawn (all-or-nothing supervision). To resume
+          # shipping from clean followers immediately AFTER the deploy
+          # step finishes (this sync step runs BEFORE the recreation, so
+          # restarting here would be too early), the deploy's post-reload
+          # block on the droplet runs:
+          #   systemctl --user restart jarvis-log-ship.service
+          # See the "Reload nginx" tail of the Deploy via SSH script.
+          ssh -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
+            "$DEPLOY_USER@$HOST" "mkdir -p $PROD_DIR/observability && for f in $OBS_CONFIG_FILES; do if [ -d \"$PROD_DIR/observability/\$f\" ]; then echo \"FATAL: $PROD_DIR/observability/\$f is a directory (podman empty-dir bind edge, JAR-458/1245) - remove it on the host before deploy\" >&2; exit 1; fi; cp $PROD_DIR/observability/\$f $PROD_DIR/observability/\$f.previous 2>/dev/null || true; done"
+          scp -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
+            deployments/observability/loki-config.yml \
+            deployments/observability/alloy-config.alloy \
+            deployments/observability/grafana-datasources.yml \
+            deployments/observability/prometheus.yml \
+            deployments/observability/prometheus-rules.yml \
+            deployments/observability/tempo.yml \
+            deployments/observability/grafana-dashboards.yml \
+            deployments/observability/dashboards-red.json \
+            deployments/observability/dashboards-kpis.json \
+            deployments/observability/grafana-alerting.yml \
+            "$DEPLOY_USER@$HOST:$PROD_DIR/observability/"
+          # The list above must equal $OBS_CONFIG_FILES; scp takes no stdin
+          # list, so it stays spelled out and the sync-parity guard
+          # (TestObservabilityConfigsSyncedInDeploy) pins it against the
+          # variable and the compose mounts.
+          # The cert lands in the deploy tree first, then root installs it.
+          # /etc/ssl/certs is not writable by a non-root deploy user, and the
+          # container bind-mounts that host path (podman-compose.yml), so the
+          # destination cannot move. `sudo install` is the one hop across, and
+          # the sudoers entry provisioned by deployments/setup-deploy-user.sh
+          # pins BOTH paths so it cannot write that cert from anywhere else.
+          #
+          # Root takes the same route rather than a shortcut: one code path
+          # means the privileged branch is the one that gets exercised on every
+          # deploy, instead of first running on the day of the cutover.
+          scp -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
+            deployments/do-pg-ca.crt \
+            "$DEPLOY_USER@$HOST:$PROD_DIR/do-pg-ca.crt"
+          # The cert lands in the deploy tree first, then root installs it
+          # per host (same one-code-path reasoning as above).
+          ssh -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
+            "$DEPLOY_USER@$HOST" \
+            "sudo install -o root -g root -m 644 $PROD_DIR/do-pg-ca.crt /etc/ssl/certs/do-pg-ca.crt"
+          done
+
+      - name: Ship nginx site config (repo is source of truth)
+        # JAR-1055: deploy.yml previously never shipped an nginx config at all
+        # (only comments and `sudo nginx -s reload`), so CSP and security-header
+        # changes in infra/nginx/sites-jarvistravel.conf (JAR-798 Plaid,
+        # JAR-944 headers) never reached /etc/nginx. Mirror the JAR-756
+        # compose-sync pattern: back up the live config, ship the repo file,
+        # and validate with the real parser BEFORE any podman change.
+        # `nginx -t` failure restores the previous config and aborts; nginx is
+        # only reloaded later, after health checks, so a broken file can never
+        # be served.
+        # JAR-2563: shipped to BOTH serving droplets; each host's key pin is
+        # verified inside the loop (DROPLET_HOST_KEY / DROPLET_HOST_KEY_2).
+        env:
+          DROPLET_HOST: ${{ env.DROPLET_HOST }}
+          DROPLET_HOST_2: ${{ env.DROPLET_HOST_2 }}
+          DEPLOY_USER: ${{ env.DEPLOY_USER }}
+          DROPLET_SSH_KEY: ${{ env.DROPLET_SSH_KEY }}
+          PROD_DIR: ${{ env.PROD_DIR }}
+          DROPLET_HOST_KEY: ${{ env.DROPLET_HOST_KEY }}
+          DROPLET_HOST_KEY_2: ${{ env.DROPLET_HOST_KEY_2 }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f /tmp/prod-ssh-key /tmp/prod-known-hosts' EXIT HUP INT TERM
+          install -m 600 /dev/null /tmp/prod-ssh-key
+          printf '%s\n' "$DROPLET_SSH_KEY" > /tmp/prod-ssh-key
+          ship_one() {
+            HOST="$1"; HOST_KEY="$2"
+          # Host-key pinning (JAR-1055 review finding): when DROPLET_HOST_KEY
+          # (SHA256 fingerprint of the droplet's ED25519 host key, from
+          # `ssh-keyscan -t ed25519 -H <host> | ssh-keygen -lf -`) is set,
+          # verify it before the first connection; otherwise fall back to
+          # accept-new, matching the JAR-756 sibling step. Optional on
+          # purpose: external keys never gate deploys.
+          # JAR-1324: the scan is restricted to ED25519. An unfiltered
+          # ssh-keyscan returns the host's three host keys (ECDSA, ED25519,
+          # RSA) in nondeterministic order, so `head -1` compared the pin
+          # against a random key type per run — a deploy coin flip.
+          if [ -n "${DROPLET_HOST_KEY:-}" ]; then
+            ssh-keyscan -t ed25519 -H "$HOST" > /tmp/prod-known-hosts 2>/dev/null
+            fp="$(ssh-keygen -lf /tmp/prod-known-hosts | awk '{print $2}' | head -1)"
+            if [ "$fp" != "$HOST_KEY" ]; then
+              echo "FATAL: droplet host key mismatch (expected $HOST_KEY, got $fp)" >&2
+              exit 1
+            fi
+            SSHRC=(-o "UserKnownHostsFile=/tmp/prod-known-hosts" -o "StrictHostKeyChecking=yes")
+          else
+            SSHRC=(-o StrictHostKeyChecking=accept-new)
+          fi
+          # Back up the live config — mandatory and fail-closed. A missing
+          # live file or a sudo denial aborts BEFORE anything is touched:
+          # .previous must always mirror what nginx is actually serving, or
+          # the restore path below cannot be trusted.
+          ssh -i /tmp/prod-ssh-key "${SSHRC[@]}" \
+            "$DEPLOY_USER@$HOST" \
+            "sudo -n cp /etc/nginx/sites-available/jarvistravel /etc/nginx/sites-available/jarvistravel.previous || { echo 'FATAL: could not back up the live nginx config' >&2; exit 1; }"
+          # Keep this filename in sync with the pinned sudoers install entry in
+          # deployments/setup-deploy-user.sh (both must name the same file, or
+          # the install silently stops matching at the non-root cutover).
+          scp -i /tmp/prod-ssh-key "${SSHRC[@]}" \
+            infra/nginx/sites-jarvistravel.conf \
+            "$DEPLOY_USER@$HOST:$PROD_DIR/sites-jarvistravel.conf"
+          # Install + validate with the real parser (sudo -n fails fast and
+          # loudly when a sudoers entry is missing). On failure, restore the
+          # previous file and abort — nginx keeps serving the old config from
+          # memory (nothing has been reloaded yet), so the box is left as found.
+          ssh -i /tmp/prod-ssh-key "${SSHRC[@]}" \
+            "$DEPLOY_USER@$HOST" \
+            "if sudo -n install -o root -g root -m 644 \"$PROD_DIR/sites-jarvistravel.conf\" /etc/nginx/sites-available/jarvistravel; then sudo -n nginx -t || { sudo -n cp /etc/nginx/sites-available/jarvistravel.previous /etc/nginx/sites-available/jarvistravel && echo 'nginx -t failed - previous config restored' >&2 || echo 'FATAL: config rejected AND restore failed - jarvistravel on disk is broken (old config still served from memory)' >&2; exit 1; }; else echo 'FATAL: install of the nginx site config failed' >&2; exit 1; fi"
+          }
+          ship_one "$DROPLET_HOST" "${DROPLET_HOST_KEY:-}"
+          ship_one "$DROPLET_HOST_2" "${DROPLET_HOST_KEY_2:-}"
+
+
+      - name: Verify the served nginx config is the shipped one
+        # JAR-1055 review finding: `nginx -t` validates the installed FILE but
+        # proves nothing about what nginx SERVES after the reload — a rebound
+        # sites-enabled symlink or a leftover conf.d server block would reload
+        # a different config with a green deploy, which is exactly the state
+        # the host is in today (effective config carries no Plaid marker).
+        # Assert the shipped file's unique marker in the live effective config
+        # and hit the API THROUGH nginx. Fail the deploy on mismatch. Runs
+        # after the reload (Deploy via SSH step) so it observes the live state.
+        # JAR-2563: verified on BOTH serving droplets.
+        env:
+          DROPLET_HOST: ${{ env.DROPLET_HOST }}
+          DROPLET_HOST_2: ${{ env.DROPLET_HOST_2 }}
+          DEPLOY_USER: ${{ env.DEPLOY_USER }}
+          DROPLET_SSH_KEY: ${{ env.DROPLET_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f /tmp/prod-ssh-key' EXIT HUP INT TERM
+          install -m 600 /dev/null /tmp/prod-ssh-key
+          printf '%s\n' "$DROPLET_SSH_KEY" > /tmp/prod-ssh-key
+          for HOST in "$DROPLET_HOST" "$DROPLET_HOST_2"; do
+            echo "=== Verify served config on $HOST ==="
+            ssh -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
+              "$DEPLOY_USER@$HOST" \
+              "sudo -n nginx -Tq | grep -q 'cdn.plaid.com' && curl -sf --resolve api.jarvistravel.com:443:127.0.0.1 https://api.jarvistravel.com/v1/health >/dev/null || { echo 'FATAL: served nginx config lacks the shipped Plaid marker, or the API is unreachable through nginx' >&2; exit 1; }"
+          done
+
+      # NOTE (JAR-375): deploy as a non-root user. The droplet must have a
+      # `deploy` user with rootless podman configured, membership in the docker
+      # group, and a sudoers NOPASSWD entry limited to `nginx -s reload`,
+      # `nginx -t`, `nginx -Tq`, and the pinned install/cp paths provisioned by
+      # deployments/setup-deploy-user.sh (JAR-1055 adds the nginx site-config
+      # ship, served-config verify, and validate commands).
+      #
+      # Third-party actions are pinned by commit SHA (JAR-470): this job holds
+      # registry-push and production-SSH credentials, so a re-pointed upstream
+      # tag would execute attacker code with them. The trailing `# vN` comment
+      # is the human-readable version only — bump the SHA, not the comment,
+      # when upgrading.
+      - name: Deploy via SSH (rolling — prod-2 first, then prod)
+        # JAR-2563: rolling deploy across both serving droplets. host list is
+        # ORDERED prod-2 first, then prod, and sync: true makes drone-ssh run
+        # them SEQUENTIALLY with fail-fast (verified in drone-ssh v1.8.2
+        # plugin.go: sync mode iterates hosts in order; the first host whose
+        # script exits non-zero sends to errChannel and Exec() returns before
+        # the next host starts). Consequence: a prod-2 failure aborts the job
+        # BEFORE prod is touched — prod keeps serving the previous release and
+        # the LB (health check 3x10s) drains prod-2 while it rolls back.
+        # Each host's script exits non-zero on its own health/rollback
+        # failure (set -e + explicit exit 1 paths below), so a rolled-back
+        # prod-2 still fails the deploy red instead of shipping half a
+        # release silently.
+        # NOTE: DEPLOY_SERVICES/LIVE_ENDPOINTS guards and rollback logic are
+        # host-local and identical on both hosts (same compose, same image
+        # set); the LB health check (HTTPS /v1/health, 3x10s) is the traffic
+        # gate while a host is down, proven by the JAR-2563 failover test.
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          # JAR-1245 review round 15: explicit step-level forward so the
+          # rollback restore loop never depends on workflow-level env
+          # resolution (same pattern as the sync step's env block).
+          OBS_CONFIG_FILES: ${{ env.OBS_CONFIG_FILES }}
+          # JAR-1326: the boundary allowlist, defined ONCE here and synced
+          # against the DO cloud firewall on jarvis-prod (inbound tcp/22
+          # from the deploy+admin sources, tcp/80+443 public, icmp). The
+          # gate below fails any rollout that leaves a non-loopback
+          # listener outside this list — adding a port here is a
+          # DELIBERATE production exposure decision and must ship with the
+          # matching firewall rule.
+          # JAR-590: 9090-9095 are prod-2's metrics listeners, bound to its VPC
+          # address for cross-host scraping — non-loopback, so they must be
+          # allowlisted here or the boundary gate rolls every prod-2 deploy
+          # back. WHO can reach them is the cloud firewall's job: prod-2's
+          # boundary admits tcp/9090-9095 ONLY from prod's VPC /32 (applied
+          # out-of-band with this change). Prod's own boundary has no such
+          # rule, so the ports stay closed there despite the shared allowlist.
+          BOUNDARY_ALLOW_PORTS: "22,80,443,9090-9095"
+          # JAR-1326 (round-21 review): the six-service list, defined ONCE
+          # here — the rollback staging loop, pull loop, rollback function,
+          # and :deployed tagging loop all iterate $DEPLOY_SERVICES so the
+          # four copies cannot drift when a service is added.
+          # Keep in lock-step with LIVE_ENDPOINTS below (same service set):
+          # a service in one but not the other is either unrolled-back or
+          # unhealth-checked. liveness_sync_test.go pins
+          # LIVE_ENDPOINTS <-> compose.
+          DEPLOY_SERVICES: "trip-core user-auth external-data ml analytics ai"
+        with:
+          host: "${{ env.DROPLET_HOST_2 }},${{ env.DROPLET_HOST }}"
+          sync: true
+          username: ${{ env.DEPLOY_USER }}
+          key: ${{ env.DROPLET_SSH_KEY }}
+          # envs: forwards the named variable into the remote shell. Without
+          # this the script block runs with a bare environment and $PROD_DIR
+          # would expand to nothing — `cd ` succeeds in some shells, so the
+          # failure would land later and somewhere unrelated.
+          envs: PROD_DIR,OBS_CONFIG_FILES,BOUNDARY_ALLOW_PORTS,DEPLOY_SERVICES
+          script: |
+            set -e
+
+            # JAR-756: podman-compose needs the working directory that holds
+            # podman-compose.yml (synced from the repo by the step above).
+            # $PROD_DIR, forwarded via envs: above. /root/jarvis when
+            # DEPLOY_USER is root, which is what it was before JAR-768.
+            cd "$PROD_DIR"
+
+            # JAR-590: prod-2 widens its metrics binds to its VPC address so
+            # prod's Prometheus can scrape cross-host. Self-detect the VPC IP
+            # (eth1) rather than matching on host name: the exported value is
+            # consumed by podman-compose's ${METRICS_BIND_ADDR:-127.0.0.1}
+            # interpolation below. Prod keeps the loopback default.
+            # Only the SECOND droplet widens: prod's metrics stay loopback
+            # (its boundary admits nothing on 9090-9095, and its Prometheus is
+            # the scraper, not a scrapee). Matching the specific .7 address is
+            # deliberate: the firewall rule and this export name the same host.
+            # Prod explicitly keeps loopback (the pass-through guard requires
+            # the env to EXIST for dict-form compose keys; absent env = the
+            # JAR-1340 silent-omission crash class).
+            if [ "$(ip -o -4 addr show | awk '$4 ~ /^10\.108\.0\.7\// {print $4}' | cut -d/ -f1 | head -1)" = "10.108.0.7" ]; then
+              export METRICS_BIND_ADDR="10.108.0.7"
+              export HEALTH_BIND_ADDR="10.108.0.7"
+              echo "JAR-590: metrics/liveness binds widened to 10.108.0.7"
+            else
+              export METRICS_BIND_ADDR="127.0.0.1"
+              export HEALTH_BIND_ADDR="127.0.0.1"
+            fi
+
+            # Fail-closed: validate the synced compose before pulling images
+            # or touching any container (JAR-756 review finding).
+            # podman-compose 1.0.6 on prod has no `config -q` (JAR-756
+            # integration run 31223117196); validate by discarding the
+            # merged output instead.
+            podman-compose config >/dev/null
+
+            echo "=== Deploying release ${{ github.sha }} ==="
+
+            # Login to DOCR
+            doctl registry login
+
+            # Stage the rollback point: whatever is running now becomes
+            # :previous. || true only covers the very first deploy, when no
+            # :current image exists yet.
+            for service in ${DEPLOY_SERVICES:?DEPLOY_SERVICES must be forwarded via the step envs: list}; do
+              podman tag ${{ env.REGISTRY }}/${{ env.REGISTRY_NAME }}/$service:current \
+                         ${{ env.REGISTRY }}/${{ env.REGISTRY_NAME }}/$service:previous 2>/dev/null || true
+            done
+
+            # Pull specific SHA-tagged images
+            for service in ${DEPLOY_SERVICES:?DEPLOY_SERVICES must be forwarded via the step envs: list}; do
+              echo "Pulling $service:${{ github.sha }}..."
+              podman pull ${{ env.REGISTRY }}/${{ env.REGISTRY_NAME }}/$service:${{ github.sha }}
+              # Tag as 'current' for easy rollback reference
+              podman tag ${{ env.REGISTRY }}/${{ env.REGISTRY_NAME }}/$service:${{ github.sha }} \
+                         ${{ env.REGISTRY }}/${{ env.REGISTRY_NAME }}/$service:current
+            done
+
+            # Update compose file to use SHA-tagged images
+            export IMAGE_TAG=${{ github.sha }}
+
+            # Fetch secrets from Infisical (JAR-747, ADR-009). Fail-closed:
+            # fetch-secrets.py exits non-zero if Infisical is unreachable or
+            # returns zero secrets, aborting the deploy before compose runs.
+            python3 "$PROD_DIR/fetch-secrets.py" prod "$PROD_DIR/.env"
+
+            # JAR-1340: podman-compose.yml passes secrets through by NAME
+            # (`JWT_PRIVATE_KEY:` with no value), so podman reads each value
+            # from its own environment rather than having it interpolated onto
+            # the command line — where podman-compose echoes it into this log.
+            # That is why thirteen credentials, including the RSA key that signs
+            # session tokens, printed unmasked across 100 retained runs.
+            #
+            # `set -a` + `.` is the sh reader $PROD_DIR/.env was designed for
+            # (JAR-1029 quotes every value so that sourcing it and
+            # podman-compose's dotenv parser agree byte-for-byte). This is not a
+            # third parser; it is the one graph-sync.yml and backup-db.sh use.
+            #
+            # Sourcing is evaluation, and .env is machine-generated from
+            # Infisical. A secret that happened to be named IMAGE_TAG would
+            # silently replace the SHA this deploy is pinning — a green deploy
+            # of the wrong images. Refuse rather than discover it later.
+            for RESERVED in PROD_DIR IMAGE_TAG DEPLOY_USER OBS_CONFIG_FILES REGISTRY REGISTRY_NAME BOUNDARY_ALLOW_PORTS DEPLOY_SERVICES; do
+              # The name is interpolated into an ERE below; refuse any
+              # future reserved name carrying regex metacharacters so the
+              # guard can never silently widen or narrow its match.
+              case "$RESERVED" in
+                *[![:upper:][:digit:]_]*) echo "FATAL: reserved name '$RESERVED' is not an ERE-safe identifier - keep reserved names to [A-Z0-9_]" >&2; exit 1 ;;
+              esac
+              # Also match `export X=` and leading-whitespace spellings: the
+              # .env is sourced under set -a, so any of those forms would
+              # clobber the workflow-supplied value just like a bare `X=`.
+              if grep -qE "^[[:space:]]*(export[[:space:]]+)?${RESERVED}[[:space:]]*=" "$PROD_DIR/.env"; then
+                echo "FATAL: $PROD_DIR/.env defines ${RESERVED}, which is one of this script's own" >&2
+                echo "       control variables. Rename it in Infisical; sourcing would clobber the deploy." >&2
+                exit 1
+              fi
+            done
+
+            set -a
+            . "$PROD_DIR/.env"
+            set +a
+
+            # The GF_* aliases used to be five `export` lines RIGHT HERE, and
+            # that was the bug (core#717 review, MEDIUM-1): they existed only
+            # inside this run: block, so the documented manual path —
+            # `set -a; . ./.env; podman-compose up -d`, what a human runs during
+            # a restart or a recovery — got none of them. Grafana booted with no
+            # admin password and no SMTP alerting, silently, on exactly the path
+            # taken when something is already wrong.
+            #
+            # fetch-secrets.py now writes them into .env, so the `set -a` source
+            # above supplies them and both paths get the same environment. Same
+            # for DATABASE_URL / REDIS_URL, which it now composes rather than
+            # leaving to compose's ${VAR} interpolation (MEDIUM-2).
+
+            # Degraded-feature check (JAR-757 Path A): dashboard-only secrets
+            # (Clerk/Stripe webhook signing) are not deploy blockers — the
+            # services boot and the affected features fail loud at use. Print
+            # a visible warning per missing secret so the deploy log is the
+            # signal, never silence. AI_SERVICE_INTERNAL_KEY is included:
+            # its absence crash-loops the sidecar (health check catches it),
+            # and DO_INFERENCE_API_KEY absence degrades /v1/embed per call.
+            for K in CLERK_SECRET_KEY CLERK_WEBHOOK_SECRET STRIPE_WEBHOOK_SECRET AI_SERVICE_INTERNAL_KEY DO_INFERENCE_API_KEY GRAFANA_ADMIN_PASSWORD; do
+              if ! grep -qE "^${K}=.+" "$PROD_DIR/.env"; then
+                echo "  ⚠️ ${K} missing/empty — feature DEGRADED until provisioned in Infisical"
+              fi
+            done
+
+            # JAR-456 liveness endpoints — THE single source for the health
+            # checks of ALL services: the pre-deploy pin assertion and the
+            # post-deploy health loop below both iterate this array (svc:ENV_KEY:port/path).
+            # Add a service's entry here when it ships an endpoint; nothing else.
+            LIVE_ENDPOINTS=('trip-core:HTTP_PORT:8080/v1/health' 'ai:AI_SERVICE_PORT:8081/v1/health' 'user-auth:HTTP_PORT:8082/health' 'ml:HTTP_PORT:8083/health' 'analytics:HTTP_PORT:8084/health' 'external-data:METRICS_PORT:9090/health')
+
+            # Assert every pin against the synced compose BEFORE any container
+            # is replaced. The parser lives in
+            # deployments/assert-liveness-pins.sh, shipped to $PROD_DIR by the
+            # compose-sync step above and executed in CI by
+            # deployments/liveness_sync_test.go against the real compose and
+            # mutation fixtures — the deploy runs exactly the code CI tests
+            # (OCR round-17: the parser previously lived inline here, where
+            # the yaml.v3-based CI guard never executed it, so a reformat that
+            # yaml still parsed — flow map, anchor — could pass CI green yet
+            # abort every deployment).
+            # Contract: compose must pin ports in
+            # block-style mappings (`KEY: "8083"` under the top-level
+            # `services:` section); list style (`- KEY=8083`), ${VAR}
+            # interpolation, or flow maps (`env: {KEY: "8083"}`) cannot
+            # match — fail-closed by design.
+            ./assert-liveness-pins.sh podman-compose.yml "${LIVE_ENDPOINTS[@]}"
+
+            # JAR-1340, and this is the half that bites: a pass-through name
+            # that is NOT in the environment is not an error to podman — it
+            # OMITS the variable from the container, silently. An absent
+            # INTERNAL_GRPC_SECRET is what rolled the JAR-1330 deploy back, and
+            # an absent JWT_PRIVATE_KEY stops user-auth booting at all. Runs
+            # before any container is replaced, like the pin assertion above.
+            # Set-but-empty passes: that is today's behaviour, and the
+            # degraded-feature warning above is the existing policy for it.
+            ./assert-env-passthrough.sh podman-compose.yml --check-exported
+
+            podman-compose up -d
+
+            # JAR-1326 review round 2: ONE rollback body, two callers — a
+            # health-check failure and a boundary violation must restore the
+            # exact same previously-blessed state, so a violating release can
+            # never survive as the next deploy's rollback point.
+            rollback_to_previous() {
+              for service in ${DEPLOY_SERVICES:?DEPLOY_SERVICES must be forwarded via the step envs: list}; do
+                # WARN (not silent) on a failed tag: a missing :previous for
+                # any reason other than the genuine first-deploy edge must be
+                # visible in the log when the rollback misbehaves later.
+                if ! podman tag ${{ env.REGISTRY }}/${{ env.REGISTRY_NAME }}/$service:previous \
+                           ${{ env.REGISTRY }}/${{ env.REGISTRY_NAME }}/$service:current 2>/dev/null; then
+                  echo "WARN: no :previous image for $service (first deploy?) — rollback will not restore it"
+                fi
+              done
+              # Restore the pre-deploy compose so the rollback re-applies
+              # the config that was actually running (JAR-756 finding 2).
+              # Only a MISSING backup is benign (first deploy); a real copy
+              # error must fail the rollback loudly — continuing with the
+              # just-failed compose would let the violating spec survive.
+              if [ -f podman-compose.yml.previous ]; then
+                cp podman-compose.yml.previous podman-compose.yml
+              fi
+              # JAR-458: same symmetry for the observability configs — a
+              # rollback must re-apply the config set the previous
+              # containers ran with, not the configs that shipped with the
+              # failed deploy. Silent only on the first-deploy edge (no
+              # .previous yet); a real copy error fails the rollback loudly.
+              for f in $OBS_CONFIG_FILES; do
+                if [ -f "observability/$f.previous" ]; then
+                  cp "observability/$f.previous" "observability/$f"
+                fi
+              done
+              # --remove-orphans removes containers whose service is absent
+              # from the restored compose (subsumes the old ai-only special
+              # case, JAR-458): a NEW network-exposed service from a violating
+              # deploy must not survive the rollback as an unrecognized
+              # listener.
+              if ! IMAGE_TAG=previous podman-compose up -d --remove-orphans; then
+                echo "FATAL: rollback compose failed to start — inspect the fleet manually" >&2
+                exit 1
+              fi
+            }
+
+            # JAR-1326: verify the network boundary against the LIVE listener
+            # table IMMEDIATELY after the fleet comes up — before the health
+            # loop (which can run ~9 min on a wedged fleet) and BEFORE nginx
+            # switches traffic. Host networking means a violating bind is
+            # directly reachable on the droplet IP the moment the container
+            # starts, so the scan runs at the earliest possible instant.
+            # Scope of this gate: WHICH ports have non-loopback listeners.
+            # WHO can reach them is the cloud firewall's job (source-
+            # restricted tcp/22, public 80/443) — the two layers are
+            # complementary, and this scan cannot detect a mis-opened
+            # firewall source range; re-verify the firewall after any change.
+            # The rollback below means the violation can never survive as the
+            # next deploy's rollback point. The source-tree guard
+            # (TestNoServiceBindsAllInterfacesDirectly) catches one Go bind
+            # spelling; this catches every mechanism. Fail-closed: an
+            # unparseable or empty scan aborts the deploy. CI executes this
+            # exact script against a deliberately exposed 0.0.0.0 fixture
+            # (deployments/assert_external_binds_test.go).
+            # JAR-1326 (round-18): one enforcer, two call sites. On a
+            # violation: with a previous state, restore it and re-verify the
+            # restored release (it predates this gate); without one (first
+            # deploy), stop the fleet and verify it is dark. Either way the
+            # deploy ends red - a violating fleet is never served and never
+            # becomes the next rollback point.
+            # ROUND-38 STRUCTURAL SAFETY: enforce_boundary RETURNS non-zero and
+            # the bare top-level statements below let set -e terminate the
+            # rollout on it. Wrapping the call in $(), a pipeline, or `|| true`
+            # would both swallow the abort AND silently disable errexit for the
+            # whole function body (breaking its unchecked `cp` steps) - so the
+            # bare-statement convention is a structural requirement, not style.
+            # verify_restored_boundary (round-71): the restored release
+            # predates this gate, so re-scan it; a still-violating restore
+            # prints the FATAL and the caller's `|| exit 1` ends the deploy.
+            verify_restored_boundary() {
+              if ! bash "$PROD_DIR/assert-external-binds.sh" "$BOUNDARY_ALLOW_PORTS"; then
+                echo "FATAL: restored previous release still violates the boundary allowlist — inspect the host manually" >&2
+                return 1
+              fi
+              return 0
+            }
+
+            enforce_boundary() {
+              # Fail fast by name if the envs: forward ever drifts (round-35).
+              local allow="${1:?BOUNDARY_ALLOW_PORTS must be forwarded via the step envs: list}"
+              if bash "$PROD_DIR/assert-external-binds.sh" "$allow"; then
+                return 0
+              fi
+              echo "=== BOUNDARY VIOLATION - Rolling back; the violating fleet is never served ==="
+              if [ -f podman-compose.yml.previous ]; then
+                rollback_to_previous
+                verify_restored_boundary
+                echo "Rolled back to previous deployment after boundary violation"
+              else
+                echo "FATAL: no pre-deploy backup (first deploy?) — no previous release to restore; stopping the fleet" >&2
+                if ! podman-compose stop; then
+                  echo "FATAL: failed to stop the first-deploy fleet — refusing to leave the boundary violation live" >&2
+                  return 1
+                fi
+                if bash "$PROD_DIR/assert-external-binds.sh" "$allow"; then
+                  echo "First-deploy violating fleet stopped; boundary clear. Deploy aborted."
+                else
+                  echo "FATAL: non-loopback listeners still present after first-deploy stop — inspect the host manually" >&2
+                fi
+              fi
+              return 1
+            }
+            enforce_boundary "$BOUNDARY_ALLOW_PORTS"
+
+
+            # Health check: every service now has a curl-able liveness
+            # endpoint. trip-core :8080/v1/health; user-auth :8082/health
+            # (HTTP_PORT added JAR-757/F3, closing the blind spot where a
+            # crash-looping user-auth deployed "green"); ai :8081/v1/health;
+            # ml :8083/health and analytics :8084/health (JAR-456 — same
+            # blind spot closed for the remaining gRPC-only services);
+            # external-data :9090/health (rides the JAR-413 metrics server).
+            # Health check for ALL services from the SAME LIVE_ENDPOINTS list
+            # the pin assertion used — one list, two guards, no second copy.
+            echo "=== Running health checks ==="
+            ALL_HEALTHY=true
+            for entry in "${LIVE_ENDPOINTS[@]}"; do
+              svc="${entry%%:*}"
+              port_path="${entry#*:}"
+              port_path="${port_path#*:}"
+              echo "Checking ${svc}..."
+              # Budgets per service (review round 15: 10 attempts cut the
+              # fast-fail budget to ~11s and rolled back services that take
+              # 11-31s to bind — cold PG pool, slow migrations):
+              #   fast-fail (connection refused while booting): 30 x
+              #     (~0.1s refuse + 1s sleep) ~= 33s — at or above the top
+              #     of the documented 11-31s bind window, so no service
+              #     that previously passed can now be rolled back while
+              #     still booting (OCR round-17: the round-16 20-attempt
+              #     loop gave ~21s and dropped binders in the 22-31s
+              #     window that the original 30-attempt loop passed).
+              #   wedged (accept queue up, handler dead; the exact case the
+              #     curl timeouts target): 30 x (2s max-time + 1s sleep) =
+              #     90s, so all six services cap at ~9.2 min — safely inside
+              #     the deploy job's 15-minute timeout, so a fleet-wide
+              #     failure still reaches the rollback block instead of the
+              #     job being killed mid-loop.
+              # Bash-native counter, not $(seq): if seq were missing the
+              # substitution would expand empty, the loop would run zero
+              # attempts, and the service would be reported healthy without
+              # a single check — a fail-open the curl guards cannot catch.
+              for ((i = 1; i <= 30; i++)); do
+                # --connect-timeout/--max-time keep a wedged-but-listening
+                # container (accept queue up, handler dead) from blocking the
+                # attempt forever: the loop must reach its cap and set
+                # ALL_HEALTHY=false so the rollback block actually runs.
+                if curl -sf --connect-timeout 2 --max-time 2 "http://localhost:${port_path}" > /dev/null 2>&1; then
+                  echo "  ✅ ${svc} is healthy"
+                  break
+                fi
+                if [ "$i" -eq 30 ]; then
+                  echo "  ❌ ${svc} failed health check after 30 attempts (fast-fail budget ~33s, wedged worst case ~90s)"
+                  ALL_HEALTHY=false
+                fi
+                sleep 1
+              done
+            done
+
+
+            if [ "$ALL_HEALTHY" = false ]; then
+              echo "=== HEALTH CHECKS FAILED - Rolling back ==="
+              # Health failures may be transient (single-service crash-loop),
+              # so unlike a boundary violation the fleet is never stopped: with
+              # a recoverable previous state we restore it; without one (first
+              # deploy, or a silently-failed backup) the attempted release
+              # stays up unserved, matching the pre-gate behavior.
+              if [ -f podman-compose.yml.previous ]; then
+                rollback_to_previous
+                # The restored release predates this gate - re-verify its
+                # boundary before calling the rollback done (round-62).
+                verify_restored_boundary || exit 1
+                echo "Rolled back to previous deployment"
+              else
+                echo "WARN: no pre-deploy compose backup (first deploy, or the backup copy failed silently) - leaving the attempted release running for inspection; nginx still serves the previous config from memory and proxies to these containers"
+              fi
+              exit 1
+            fi
+
+            # Settled-fleet re-scan: services with restart policies or
+            # ordered startup can bind AFTER the fleet-up scan, so the
+            # boundary is re-verified on the fully-settled fleet before
+            # nginx switches traffic. A violation here ends the deploy red.
+            # The allowlist source matches the enforcer's internal calls
+            # ($BOUNDARY_ALLOW_PORTS forwarded by envs: into this script).
+            enforce_boundary "$BOUNDARY_ALLOW_PORTS"
+
+            # Reload nginx (deploy user has a scoped NOPASSWD sudoers entry).
+            # No || true: if the reload fails, traffic may still hit the old
+            # release — the deploy must report failure, not success.
+            sudo nginx -s reload
+
+            # JAR-1245: podman-compose up -d above RECREATED any service
+            # whose image changed, killing that service's `podman logs -f`
+            # follower in the log-shipper unit. The unit self-heals via
+            # Restart=always, but restart it here so shipping resumes from
+            # clean followers immediately. Not fully silent: a missing unit
+            # is expected (hosts that never installed the shipper), but any
+            # OTHER failure is logged so a post-deploy log gap is
+            # diagnosable from this run's output. A non-login SSH session
+            # may lack XDG_RUNTIME_DIR — point it at the deploy user's
+            # runtime dir explicitly when unset.
+            # OCR run 33822261505: derive the fallback unconditionally from
+            # the runtime dir's existence - a session with XDG_RUNTIME_DIR
+            # already set but pointing at a dead dir gets the same retry as
+            # an unset one, and a live session is never restarted twice.
+            # OCR round-4 (run 33824695355): plain restart, not try-restart -
+            # try-restart is a silent SUCCESS no-op on a present-but-FAILED
+            # unit (shipper hit its start limit), which would leave shipping
+            # down with no WARN. restart revives failed units and still
+            # fails loudly on a missing unit (the WARN branch below).
+            first_out=""
+            if ! first_out=$(timeout 10s systemctl --user restart jarvis-log-ship.service 2>&1); then
+              # OCR round-7: probe the unit FILE FIRST - it needs no bus -
+              # so hosts that never installed the shipper get the benign
+              # INFO even without a runtime dir, and WARN is reserved for
+              # genuinely un-restartable installs. OCR round-7: every
+              # systemctl call is bounded (timeout 10s) so a wedged user
+              # manager can't hang the tail of an already-live deploy.
+              if [ ! -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/jarvis-log-ship.service" ]; then
+                echo "INFO: jarvis-log-ship unit not installed on this host; skipping restart (expected on hosts without the shipper)"
+              elif [ -d "/run/user/$(id -u)" ]; then
+                export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+                export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+                if ! restart_out=$(timeout 10s systemctl --user restart jarvis-log-ship.service 2>&1); then
+                  echo "WARN: could not restart jarvis-log-ship: ${restart_out:-${first_out:-unknown error}}; app-log shipping may lag one respawn"
+                fi
+              else
+                echo "WARN: no user session bus at /run/user/$(id -u); could not restart jarvis-log-ship (${first_out:-unknown error}); app-log shipping may lag one respawn"
+              fi
+            fi
+
+            # Tag successfully deployed images as 'deployed'. No || true: the
+            # images were just pulled, so a tagging failure is a real error.
+            # (:previous was staged from :current before the pull, so the next
+            # rollback point is already in place.)
+            for service in ${DEPLOY_SERVICES:?DEPLOY_SERVICES must be forwarded via the step envs: list}; do
+              podman tag ${{ env.REGISTRY }}/${{ env.REGISTRY_NAME }}/$service:${{ github.sha }} \
+                         ${{ env.REGISTRY }}/${{ env.REGISTRY_NAME }}/$service:deployed
+            done
+
+            echo "=== Deployment of ${{ github.sha }} completed successfully ==="
