@@ -152,7 +152,7 @@ jobs:
           client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
           client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
           path: /core
-          required-keys: DROPLET_HOST DROPLET_HOST_2 DROPLET_HOST_KEY DROPLET_HOST_KEY_2 DEPLOY_USER DROPLET_SSH_KEY
+          required-keys: DROPLET_HOST DEPLOY_USER DROPLET_SSH_KEY
 
       # JAR-768: the deploy tree follows the deploy user, so the cutover to a
       # non-root account is a SECRET change and not a workflow change.
@@ -173,19 +173,15 @@ jobs:
           fi
           echo "PROD_DIR=$PROD_DIR" >> "$GITHUB_ENV"
 
-      - name: Sync compose + CA cert to both serving droplets
+      - name: Sync compose + CA cert to prod
         # JAR-756: prod's compose file was stale (hardcoded :latest, pre
         # JAR-471) and the deploy never updated it — deploys silently
         # no-op'd since JAR-471 removed :latest from the registry. The repo
         # is the source of truth: ship podman-compose.yml + the DO PG CA
         # cert (verify-full DB TLS) before the deploy runs. Fail-closed:
         # a failed sync aborts before any podman change.
-        # JAR-2563: synced to BOTH serving droplets (prod + prod-2) — the
-        # sync/ship/assert scripts the deploy runs must exist on every host
-        # the rolling deploy touches, or the second pass runs stale guards.
         env:
           DROPLET_HOST: ${{ env.DROPLET_HOST }}
-          DROPLET_HOST_2: ${{ env.DROPLET_HOST_2 }}
           DEPLOY_USER: ${{ env.DEPLOY_USER }}
           DROPLET_SSH_KEY: ${{ env.DROPLET_SSH_KEY }}
           PROD_DIR: ${{ env.PROD_DIR }}
@@ -198,36 +194,35 @@ jobs:
           trap 'rm -f /tmp/prod-ssh-key' EXIT
           install -m 600 /dev/null /tmp/prod-ssh-key
           printf '%s\n' "$DROPLET_SSH_KEY" > /tmp/prod-ssh-key
-          for HOST in "$DROPLET_HOST" "$DROPLET_HOST_2"; do
-          # Back up the host's current compose before overwriting, so the
+          # Back up prod's current compose before overwriting, so the
           # rollback path can restore the config that is actually running
           # (JAR-756 review finding 2).
           ssh -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
-            "$DEPLOY_USER@$HOST" \
+            "$DEPLOY_USER@$DROPLET_HOST" \
             "cp $PROD_DIR/podman-compose.yml $PROD_DIR/podman-compose.yml.previous 2>/dev/null || true"
           scp -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
             deployments/podman-compose.yml \
-            "$DEPLOY_USER@$HOST:$PROD_DIR/podman-compose.yml"
+            "$DEPLOY_USER@$DROPLET_HOST:$PROD_DIR/podman-compose.yml"
           # The pin assertion runs FROM this tree on the remote host, so the
           # script must ship with the compose it validates — one code path,
           # tested in CI by deployments/liveness_sync_test.go against the
           # same file.
           scp -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
             deployments/assert-liveness-pins.sh \
-            "$DEPLOY_USER@$HOST:$PROD_DIR/assert-liveness-pins.sh"
+            "$DEPLOY_USER@$DROPLET_HOST:$PROD_DIR/assert-liveness-pins.sh"
           # Same rule as the pin assertion: the guard runs FROM the remote tree,
           # so it must ship with the compose it checks. Tested in CI by
           # deployments/test-assert-env-passthrough.sh against this same file.
           scp -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
             deployments/assert-env-passthrough.sh \
-            "$DEPLOY_USER@$HOST:$PROD_DIR/assert-env-passthrough.sh"
+            "$DEPLOY_USER@$DROPLET_HOST:$PROD_DIR/assert-env-passthrough.sh"
           # JAR-1326: the deploy-time network boundary gate ships with the
           # compose it protects, same one-code-path contract as
           # assert-liveness-pins.sh above — the scanner the deploy runs is
           # the scanner CI tests (deployments/assert_external_binds_test.go).
           scp -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
             deployments/assert-external-binds.sh \
-            "$DEPLOY_USER@$HOST:$PROD_DIR/assert-external-binds.sh"
+            "$DEPLOY_USER@$DROPLET_HOST:$PROD_DIR/assert-external-binds.sh"
           # JAR-458: podman-compose.yml's observability services bind-mount
           # ./observability/* relative to the compose file. The configs must
           # ship with it: podman creates EMPTY DIRECTORIES at missing bind
@@ -255,7 +250,7 @@ jobs:
           #   systemctl --user restart jarvis-log-ship.service
           # See the "Reload nginx" tail of the Deploy via SSH script.
           ssh -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
-            "$DEPLOY_USER@$HOST" "mkdir -p $PROD_DIR/observability && for f in $OBS_CONFIG_FILES; do if [ -d \"$PROD_DIR/observability/\$f\" ]; then echo \"FATAL: $PROD_DIR/observability/\$f is a directory (podman empty-dir bind edge, JAR-458/1245) - remove it on the host before deploy\" >&2; exit 1; fi; cp $PROD_DIR/observability/\$f $PROD_DIR/observability/\$f.previous 2>/dev/null || true; done"
+            "$DEPLOY_USER@$DROPLET_HOST" "mkdir -p $PROD_DIR/observability && for f in $OBS_CONFIG_FILES; do if [ -d \"$PROD_DIR/observability/\$f\" ]; then echo \"FATAL: $PROD_DIR/observability/\$f is a directory (podman empty-dir bind edge, JAR-458/1245) - remove it on the host before deploy\" >&2; exit 1; fi; cp $PROD_DIR/observability/\$f $PROD_DIR/observability/\$f.previous 2>/dev/null || true; done"
           scp -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
             deployments/observability/loki-config.yml \
             deployments/observability/alloy-config.alloy \
@@ -267,7 +262,7 @@ jobs:
             deployments/observability/dashboards-red.json \
             deployments/observability/dashboards-kpis.json \
             deployments/observability/grafana-alerting.yml \
-            "$DEPLOY_USER@$HOST:$PROD_DIR/observability/"
+            "$DEPLOY_USER@$DROPLET_HOST:$PROD_DIR/observability/"
           # The list above must equal $OBS_CONFIG_FILES; scp takes no stdin
           # list, so it stays spelled out and the sync-parity guard
           # (TestObservabilityConfigsSyncedInDeploy) pins it against the
@@ -284,13 +279,10 @@ jobs:
           # deploy, instead of first running on the day of the cutover.
           scp -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
             deployments/do-pg-ca.crt \
-            "$DEPLOY_USER@$HOST:$PROD_DIR/do-pg-ca.crt"
-          # The cert lands in the deploy tree first, then root installs it
-          # per host (same one-code-path reasoning as above).
+            "$DEPLOY_USER@$DROPLET_HOST:$PROD_DIR/do-pg-ca.crt"
           ssh -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
-            "$DEPLOY_USER@$HOST" \
+            "$DEPLOY_USER@$DROPLET_HOST" \
             "sudo install -o root -g root -m 644 $PROD_DIR/do-pg-ca.crt /etc/ssl/certs/do-pg-ca.crt"
-          done
 
       - name: Ship nginx site config (repo is source of truth)
         # JAR-1055: deploy.yml previously never shipped an nginx config at all
@@ -302,23 +294,17 @@ jobs:
         # `nginx -t` failure restores the previous config and aborts; nginx is
         # only reloaded later, after health checks, so a broken file can never
         # be served.
-        # JAR-2563: shipped to BOTH serving droplets; each host's key pin is
-        # verified inside the loop (DROPLET_HOST_KEY / DROPLET_HOST_KEY_2).
         env:
           DROPLET_HOST: ${{ env.DROPLET_HOST }}
-          DROPLET_HOST_2: ${{ env.DROPLET_HOST_2 }}
           DEPLOY_USER: ${{ env.DEPLOY_USER }}
           DROPLET_SSH_KEY: ${{ env.DROPLET_SSH_KEY }}
           PROD_DIR: ${{ env.PROD_DIR }}
           DROPLET_HOST_KEY: ${{ env.DROPLET_HOST_KEY }}
-          DROPLET_HOST_KEY_2: ${{ env.DROPLET_HOST_KEY_2 }}
         run: |
           set -euo pipefail
           trap 'rm -f /tmp/prod-ssh-key /tmp/prod-known-hosts' EXIT HUP INT TERM
           install -m 600 /dev/null /tmp/prod-ssh-key
           printf '%s\n' "$DROPLET_SSH_KEY" > /tmp/prod-ssh-key
-          ship_one() {
-            HOST="$1"; HOST_KEY="$2"
           # Host-key pinning (JAR-1055 review finding): when DROPLET_HOST_KEY
           # (SHA256 fingerprint of the droplet's ED25519 host key, from
           # `ssh-keyscan -t ed25519 -H <host> | ssh-keygen -lf -`) is set,
@@ -330,10 +316,10 @@ jobs:
           # RSA) in nondeterministic order, so `head -1` compared the pin
           # against a random key type per run — a deploy coin flip.
           if [ -n "${DROPLET_HOST_KEY:-}" ]; then
-            ssh-keyscan -t ed25519 -H "$HOST" > /tmp/prod-known-hosts 2>/dev/null
+            ssh-keyscan -t ed25519 -H "$DROPLET_HOST" > /tmp/prod-known-hosts 2>/dev/null
             fp="$(ssh-keygen -lf /tmp/prod-known-hosts | awk '{print $2}' | head -1)"
-            if [ "$fp" != "$HOST_KEY" ]; then
-              echo "FATAL: droplet host key mismatch (expected $HOST_KEY, got $fp)" >&2
+            if [ "$fp" != "$DROPLET_HOST_KEY" ]; then
+              echo "FATAL: droplet host key mismatch (expected $DROPLET_HOST_KEY, got $fp)" >&2
               exit 1
             fi
             SSHRC=(-o "UserKnownHostsFile=/tmp/prod-known-hosts" -o "StrictHostKeyChecking=yes")
@@ -345,25 +331,21 @@ jobs:
           # .previous must always mirror what nginx is actually serving, or
           # the restore path below cannot be trusted.
           ssh -i /tmp/prod-ssh-key "${SSHRC[@]}" \
-            "$DEPLOY_USER@$HOST" \
+            "$DEPLOY_USER@$DROPLET_HOST" \
             "sudo -n cp /etc/nginx/sites-available/jarvistravel /etc/nginx/sites-available/jarvistravel.previous || { echo 'FATAL: could not back up the live nginx config' >&2; exit 1; }"
           # Keep this filename in sync with the pinned sudoers install entry in
           # deployments/setup-deploy-user.sh (both must name the same file, or
           # the install silently stops matching at the non-root cutover).
           scp -i /tmp/prod-ssh-key "${SSHRC[@]}" \
             infra/nginx/sites-jarvistravel.conf \
-            "$DEPLOY_USER@$HOST:$PROD_DIR/sites-jarvistravel.conf"
+            "$DEPLOY_USER@$DROPLET_HOST:$PROD_DIR/sites-jarvistravel.conf"
           # Install + validate with the real parser (sudo -n fails fast and
           # loudly when a sudoers entry is missing). On failure, restore the
           # previous file and abort — nginx keeps serving the old config from
           # memory (nothing has been reloaded yet), so the box is left as found.
           ssh -i /tmp/prod-ssh-key "${SSHRC[@]}" \
-            "$DEPLOY_USER@$HOST" \
+            "$DEPLOY_USER@$DROPLET_HOST" \
             "if sudo -n install -o root -g root -m 644 \"$PROD_DIR/sites-jarvistravel.conf\" /etc/nginx/sites-available/jarvistravel; then sudo -n nginx -t || { sudo -n cp /etc/nginx/sites-available/jarvistravel.previous /etc/nginx/sites-available/jarvistravel && echo 'nginx -t failed - previous config restored' >&2 || echo 'FATAL: config rejected AND restore failed - jarvistravel on disk is broken (old config still served from memory)' >&2; exit 1; }; else echo 'FATAL: install of the nginx site config failed' >&2; exit 1; fi"
-          }
-          ship_one "$DROPLET_HOST" "${DROPLET_HOST_KEY:-}"
-          ship_one "$DROPLET_HOST_2" "${DROPLET_HOST_KEY_2:-}"
-
 
       - name: Verify the served nginx config is the shipped one
         # JAR-1055 review finding: `nginx -t` validates the installed FILE but
@@ -374,10 +356,8 @@ jobs:
         # Assert the shipped file's unique marker in the live effective config
         # and hit the API THROUGH nginx. Fail the deploy on mismatch. Runs
         # after the reload (Deploy via SSH step) so it observes the live state.
-        # JAR-2563: verified on BOTH serving droplets.
         env:
           DROPLET_HOST: ${{ env.DROPLET_HOST }}
-          DROPLET_HOST_2: ${{ env.DROPLET_HOST_2 }}
           DEPLOY_USER: ${{ env.DEPLOY_USER }}
           DROPLET_SSH_KEY: ${{ env.DROPLET_SSH_KEY }}
         run: |
@@ -385,12 +365,9 @@ jobs:
           trap 'rm -f /tmp/prod-ssh-key' EXIT HUP INT TERM
           install -m 600 /dev/null /tmp/prod-ssh-key
           printf '%s\n' "$DROPLET_SSH_KEY" > /tmp/prod-ssh-key
-          for HOST in "$DROPLET_HOST" "$DROPLET_HOST_2"; do
-            echo "=== Verify served config on $HOST ==="
-            ssh -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
-              "$DEPLOY_USER@$HOST" \
-              "sudo -n nginx -Tq | grep -q 'cdn.plaid.com' && curl -sf --resolve api.jarvistravel.com:443:127.0.0.1 https://api.jarvistravel.com/v1/health >/dev/null || { echo 'FATAL: served nginx config lacks the shipped Plaid marker, or the API is unreachable through nginx' >&2; exit 1; }"
-          done
+          ssh -i /tmp/prod-ssh-key -o StrictHostKeyChecking=accept-new \
+            "$DEPLOY_USER@$DROPLET_HOST" \
+            "sudo -n nginx -Tq | grep -q 'cdn.plaid.com' && curl -sf --resolve api.jarvistravel.com:443:127.0.0.1 https://api.jarvistravel.com/v1/health >/dev/null || { echo 'FATAL: served nginx config lacks the shipped Plaid marker, or the API is unreachable through nginx' >&2; exit 1; }"
 
       # NOTE (JAR-375): deploy as a non-root user. The droplet must have a
       # `deploy` user with rootless podman configured, membership in the docker
@@ -404,23 +381,7 @@ jobs:
       # tag would execute attacker code with them. The trailing `# vN` comment
       # is the human-readable version only — bump the SHA, not the comment,
       # when upgrading.
-      - name: Deploy via SSH (rolling — prod-2 first, then prod)
-        # JAR-2563: rolling deploy across both serving droplets. host list is
-        # ORDERED prod-2 first, then prod, and sync: true makes drone-ssh run
-        # them SEQUENTIALLY with fail-fast (verified in drone-ssh v1.8.2
-        # plugin.go: sync mode iterates hosts in order; the first host whose
-        # script exits non-zero sends to errChannel and Exec() returns before
-        # the next host starts). Consequence: a prod-2 failure aborts the job
-        # BEFORE prod is touched — prod keeps serving the previous release and
-        # the LB (health check 3x10s) drains prod-2 while it rolls back.
-        # Each host's script exits non-zero on its own health/rollback
-        # failure (set -e + explicit exit 1 paths below), so a rolled-back
-        # prod-2 still fails the deploy red instead of shipping half a
-        # release silently.
-        # NOTE: DEPLOY_SERVICES/LIVE_ENDPOINTS guards and rollback logic are
-        # host-local and identical on both hosts (same compose, same image
-        # set); the LB health check (HTTPS /v1/health, 3x10s) is the traffic
-        # gate while a host is down, proven by the JAR-2563 failover test.
+      - name: Deploy via SSH
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
         env:
           # JAR-1245 review round 15: explicit step-level forward so the
@@ -434,14 +395,7 @@ jobs:
           # listener outside this list — adding a port here is a
           # DELIBERATE production exposure decision and must ship with the
           # matching firewall rule.
-          # JAR-590: 9090-9095 are prod-2's metrics listeners, bound to its VPC
-          # address for cross-host scraping — non-loopback, so they must be
-          # allowlisted here or the boundary gate rolls every prod-2 deploy
-          # back. WHO can reach them is the cloud firewall's job: prod-2's
-          # boundary admits tcp/9090-9095 ONLY from prod's VPC /32 (applied
-          # out-of-band with this change). Prod's own boundary has no such
-          # rule, so the ports stay closed there despite the shared allowlist.
-          BOUNDARY_ALLOW_PORTS: "22,80,443,9090-9095"
+          BOUNDARY_ALLOW_PORTS: "22,80,443"
           # JAR-1326 (round-21 review): the six-service list, defined ONCE
           # here — the rollback staging loop, pull loop, rollback function,
           # and :deployed tagging loop all iterate $DEPLOY_SERVICES so the
@@ -452,8 +406,7 @@ jobs:
           # LIVE_ENDPOINTS <-> compose.
           DEPLOY_SERVICES: "trip-core user-auth external-data ml analytics ai"
         with:
-          host: "${{ env.DROPLET_HOST_2 }},${{ env.DROPLET_HOST }}"
-          sync: true
+          host: ${{ env.DROPLET_HOST }}
           username: ${{ env.DEPLOY_USER }}
           key: ${{ env.DROPLET_SSH_KEY }}
           # envs: forwards the named variable into the remote shell. Without
@@ -469,27 +422,6 @@ jobs:
             # $PROD_DIR, forwarded via envs: above. /root/jarvis when
             # DEPLOY_USER is root, which is what it was before JAR-768.
             cd "$PROD_DIR"
-
-            # JAR-590: prod-2 widens its metrics binds to its VPC address so
-            # prod's Prometheus can scrape cross-host. Self-detect the VPC IP
-            # (eth1) rather than matching on host name: the exported value is
-            # consumed by podman-compose's ${METRICS_BIND_ADDR:-127.0.0.1}
-            # interpolation below. Prod keeps the loopback default.
-            # Only the SECOND droplet widens: prod's metrics stay loopback
-            # (its boundary admits nothing on 9090-9095, and its Prometheus is
-            # the scraper, not a scrapee). Matching the specific .7 address is
-            # deliberate: the firewall rule and this export name the same host.
-            # Prod explicitly keeps loopback (the pass-through guard requires
-            # the env to EXIST for dict-form compose keys; absent env = the
-            # JAR-1340 silent-omission crash class).
-            if [ "$(ip -o -4 addr show | awk '$4 ~ /^10\.108\.0\.7\// {print $4}' | cut -d/ -f1 | head -1)" = "10.108.0.7" ]; then
-              export METRICS_BIND_ADDR="10.108.0.7"
-              export HEALTH_BIND_ADDR="10.108.0.7"
-              echo "JAR-590: metrics/liveness binds widened to 10.108.0.7"
-            else
-              export METRICS_BIND_ADDR="127.0.0.1"
-              export HEALTH_BIND_ADDR="127.0.0.1"
-            fi
 
             # Fail-closed: validate the synced compose before pulling images
             # or touching any container (JAR-756 review finding).
