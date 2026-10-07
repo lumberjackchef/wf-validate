@@ -406,7 +406,7 @@ jobs:
           # LIVE_ENDPOINTS <-> compose.
           DEPLOY_SERVICES: "trip-core user-auth external-data ml analytics ai"
         with:
-          host: "${{ env.DROPLET_HOST_2 }},${{ env.DROPLET_HOST }}"
+          host: ${{ env.DROPLET_HOST }}
           sync: true
           username: ${{ env.DEPLOY_USER }}
           key: ${{ env.DROPLET_SSH_KEY }}
