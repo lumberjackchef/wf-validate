@@ -404,7 +404,7 @@ jobs:
       # tag would execute attacker code with them. The trailing `# vN` comment
       # is the human-readable version only — bump the SHA, not the comment,
       # when upgrading.
-      - name: Deploy via SSH (rolling — prod-2 first, then prod)
+      - name: Deploy to Production
         # JAR-2563: rolling deploy across both serving droplets. host list is
         # ORDERED prod-2 first, then prod, and sync: true makes drone-ssh run
         # them SEQUENTIALLY with fail-fast (verified in drone-ssh v1.8.2
